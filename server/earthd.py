@@ -69,6 +69,7 @@ import re  # noqa: E402
 import secrets  # noqa: E402
 import sys  # noqa: E402
 import shutil  # noqa: E402
+import collections  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
 from collections import OrderedDict, deque  # noqa: E402
@@ -248,6 +249,7 @@ SMALL_FAST_BASE_V = 35.0        # m/s (78 mph): FAST_BASE_V on a small machine (
 BASE_FAST_WAIT_S = 0.15         # heights, then goes without it (block_base later): blocks took 0.6-3 s at 600 mph on a
                                 # Steam Deck, mostly the photo (heights 0.1-0.4 s), and the game paused 11 times a minute
 QUICK_SYNC_MAX_V = 100.0        # m/s (224 mph): slower, a block built ahead gets its stand-in photo before it is ready
+RECENT_FULL = 2                 # full ground photos kept for the stand-ins' overlap (write_quick_base)
 QUICK_MIN_COVER = 0.8          # share of a stand-in's texels real imagery must cover (else no stand-in)
 QUICK_BASE_PX = 512             # a block's stand-in photo (write_quick_base): the imagery alone, 2 m texels
 BASE_WAIT_S = 0.5               # ... and at any speed this long: a 4-core PC's photos took ~26 s while the car was held at
@@ -799,6 +801,8 @@ class Server:
         self.base_stale = set()         # blocks whose base photo lacks lazy imagery (NAIP) still to come
         self.base_skipped = set()      # blocks built without their photo (a fast player's prefetch: base_refresh)
         self.quick_pool = ThreadPoolExecutor(1, thread_name_prefix="quick-base")   # stand-in photos (_quick_later)
+        self.recent_full = collections.deque(maxlen=RECENT_FULL)    # (anchorId, cx, cy, rgb) of the last full photos
+        self.base_lock = threading.Lock()
         self.pads_rebuild = set()       # blocks built without gas station pads that lie on them (pads_stale)
         self.roads_rebuild = set()      # blocks built before every road cell under them was on disk (roads_refresh)
         self.pads_changed_at = 0.0      # (time.monotonic) the last new pad: Connection.pads_refresh waits a little
@@ -2338,21 +2342,43 @@ class Server:
         x0, y0 = cx - size / 2 - BASE_SHIFT_M, cy - size / 2 - BASE_SHIFT_M
         key = (anchor.id, cx, cy)
         try:
-            with (self.deshadow.no_wait() if self.deshadow is not None else contextlib.nullcontext()):
-                rgb, used = self.imagery.render(anchor.frame, x0, y0, size, QUICK_BASE_PX, set())
-            covered = sum(v for k, v in (used or {}).items() if k != "colormatch")
-            if covered < QUICK_MIN_COVER * QUICK_BASE_PX * QUICK_BASE_PX:
-                # its imagery not here yet: the renderer's dirt-brown fill over the whole block (the user, 2026-10-30:
-                # "the entire ground now turns brown"); none then, as before
-                return None
-            rgb = np.asarray(rgb, np.uint8)
-            if roadsmod.ROADS_IN_GROUND:    # the carriageways painted in at its own size (cached roads only): without
-                try:                        # them the roads' paint came and went at speed (the user, 2026-10-30)
-                    rgb = surfacemod.paint_square(rgb, anchor.frame, x0, y0, size, self.surface, self.road_widths)
-                except Exception as e:
-                    log.debug("quick base photo %s: roads: %s", key, e)
-            # (at the photo's own size: the engine refuses another, "dont have required size of 4096-4096")
-            rgb = surfacemod.enlarge(rgb, self.base_px)
+            # the last full photos' overlap first: the block moves on every 128 m, and ground already shown with its
+            # photo turned to the stand-in (or the flat base) with each new block (the user, 2026-10-30: "it flashes
+            # already painted/loaded terrain instead of new terrain")
+            n = self.base_px
+            rgb = np.zeros((n, n, 3), np.uint8)
+            have = np.zeros((n, n), bool)
+            sc = n / size
+            with self.base_lock:
+                recent = list(self.recent_full)
+            for aid, ocx, ocy, orgb in reversed(recent):        # (the newest first)
+                if aid != anchor.id or orgb.shape[:2] != (n, n):
+                    continue
+                dx, dy = int(round((cx - ocx) * sc)), int(round((ocy - cy) * sc))
+                i0, i1, j0, j1 = max(0, -dy), min(n, n - dy), max(0, -dx), min(n, n - dx)
+                if i0 >= i1 or j0 >= j1:
+                    continue
+                free = ~have[i0:i1, j0:j1]
+                rgb[i0:i1, j0:j1][free] = orgb[i0 + dy:i1 + dy, j0 + dx:j1 + dx][free]
+                have[i0:i1, j0:j1] = True
+            if not have.all():          # the rest (the new ground at the block's edge): the imagery alone
+                with (self.deshadow.no_wait() if self.deshadow is not None else contextlib.nullcontext()):
+                    small, used = self.imagery.render(anchor.frame, x0, y0, size, QUICK_BASE_PX, set())
+                covered = sum(v for k, v in (used or {}).items() if k != "colormatch")
+                if covered < QUICK_MIN_COVER * QUICK_BASE_PX * QUICK_BASE_PX and have.mean() < 0.5:
+                    # its imagery not here yet and little of it shown before: the renderer's dirt-brown fill over the
+                    # block ("the entire ground now turns brown"); none then, as before
+                    return None
+                small = np.asarray(small, np.uint8)
+                if roadsmod.ROADS_IN_GROUND:    # the carriageways painted in at its own size (cached roads only)
+                    try:
+                        small = surfacemod.paint_square(small, anchor.frame, x0, y0, size, self.surface,
+                                                        self.road_widths)
+                    except Exception as e:
+                        log.debug("quick base photo %s: roads: %s", key, e)
+                # (at the photo's own size: the engine refuses another, "dont have required size of 4096-4096")
+                big = surfacemod.enlarge(small, n)
+                rgb[~have] = big[~have]
             name = self.quick_base_name(key)
             path = os.path.join(self.out_dir, name)
             tmp = staging.tmp_for(path)
@@ -2429,6 +2455,8 @@ class Server:
             self.base_stale.add(key)
         if photo is not None:
             photo.append(rgb)
+        with self.base_lock:    # (the stand-ins of the blocks after it take its overlap: write_quick_base)
+            self.recent_full.append((anchor.id, cx, cy, rgb))
         t1 = time.perf_counter()
         tmp = staging.tmp_for(path)
         # stored, not deflated: the game reads the packed cache entry (terraincache), this file only if that is stale;
