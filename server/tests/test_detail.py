@@ -202,7 +202,7 @@ class DetailFastPhotoLaterTest(ServerHarness):
     cells = 64
     block = 512
 
-    def test_photo_follows_the_block(self):
+    def _slow_block(self, speed):
         self.hello()
         aid = self.prepare_anchor(1, LAT, LON)["anchorId"]
         s = self.server
@@ -213,21 +213,37 @@ class DetailFastPhotoLaterTest(ServerHarness):
             return orig(*a, **kw)
         s.write_base = slow
         s.fast = True
+        s.speed = speed
         t0 = time.monotonic()
         self.c.send({"type": "prepare_terrain", "requestId": 3, "anchorId": aid, "cx": 512.0, "cy": 0.0})
         tr, _ = self.c.until(lambda m: m["type"] == "terrain_ready", timeout=60)
-        self.assertNotIn("base", tr, "sent without its photo")
         self.assertLess(time.monotonic() - t0, 0.95, "not held for the photo")
-        # a stand-in right after it (the imagery alone, write_quick_base; the level's green base was GitHub #548), then
-        # its own photo
-        q, _ = self.c.until(lambda m: m["type"] == "block_base", timeout=30)
-        self.assertTrue(q["base"].endswith("_base_q.png"), "a stand-in first")
-        self.assertTrue(os.path.exists(self.fs(q["base"])))
+        return aid, tr
+
+    def _own_photo_follows(self, aid):
+        s = self.server
         m, _ = self.c.until(lambda m: m["type"] == "block_base" and not m["base"].endswith("_base_q.png"), timeout=30)
         self.assertEqual((m["anchorId"], m["cx"], m["cy"]), (aid, 512.0, 0.0))
         self.assertTrue(os.path.exists(self.fs(m["base"])))
         self.assertEqual(s.hm[(aid, 512.0, 0.0)]["base"], os.path.basename(m["base"]))
         self.assertFalse(m["base"].endswith("_base_q.png"), "its own photo replaced the stand-in")
+
+    def test_photo_follows_the_block(self):
+        """Below QUICK_SYNC_MAX_V the block goes with its stand-in (the ground went to the flat base until it came)."""
+        aid, tr = self._slow_block(0.0)
+        self.assertTrue(tr.get("base", "").endswith("_base_q.png"), "sent with its stand-in")
+        self.assertTrue(os.path.exists(self.fs(tr["base"])))
+        self._own_photo_follows(aid)
+
+    def test_stand_in_follows_when_faster(self):
+        """Faster: sent without a photo, a stand-in right after it (the imagery alone, write_quick_base; the level's
+        green base was GitHub #548), then its own photo."""
+        aid, tr = self._slow_block(earthd.QUICK_SYNC_MAX_V + 10)
+        self.assertNotIn("base", tr, "sent without its photo")
+        q, _ = self.c.until(lambda m: m["type"] == "block_base", timeout=30)
+        self.assertTrue(q["base"].endswith("_base_q.png"), "a stand-in first")
+        self.assertTrue(os.path.exists(self.fs(q["base"])))
+        self._own_photo_follows(aid)
 
 
 class DetailNoImageryTest(ServerHarness):

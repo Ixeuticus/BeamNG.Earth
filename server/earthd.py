@@ -248,7 +248,7 @@ FAST_BASE_V = 70.0              # m/s (157 mph): faster, a block waits at most B
 SMALL_FAST_BASE_V = 35.0        # m/s (78 mph): FAST_BASE_V on a small machine (budget.small: a Steam Deck)
 BASE_FAST_WAIT_S = 0.15         # heights, then goes without it (block_base later): blocks took 0.6-3 s at 600 mph on a
                                 # Steam Deck, mostly the photo (heights 0.1-0.4 s), and the game paused 11 times a minute
-QUICK_SYNC_MAX_V = 100.0        # m/s (224 mph): slower, a block built ahead gets its stand-in photo before it is ready
+QUICK_SYNC_MAX_V = 150.0        # m/s (335 mph): slower, a block built ahead gets its stand-in photo before it is ready (224 mph left a player at 230 mph with brown flashes)
 RECENT_FULL = 2                 # full ground photos kept for the stand-ins' overlap (write_quick_base)
 QUICK_MIN_COVER = 0.8          # share of a stand-in's texels real imagery must cover (else no stand-in)
 QUICK_BASE_PX = 512             # a block's stand-in photo (write_quick_base): the imagery alone, 2 m texels
@@ -2230,9 +2230,15 @@ class Server:
                 # swapped twice (stand-in, then the photo) and flashed at each (the user at 57-124 mph, 2026-10-30)
                 concurrent.futures.wait([base], timeout=BASE_FAST_WAIT_S if self.fast else None)
             if not base.done():
-                # the block goes now, a stand-in photo right after it (quick_later) and its own when done (block_base)
+                # the block goes now with a stand-in photo (below QUICK_SYNC_MAX_V made first: sent without one, the
+                # ground the last blocks had already shown went to the flat base until it came, "it flashes already
+                # painted ground", the user at 230 mph, 2026-10-30; faster, right after it) and its own when done
                 info["base"] = None
-                self.quick_pool.submit(self._quick_later, anchor, cx, cy)
+                if getattr(self, "speed", 0.0) < QUICK_SYNC_MAX_V and self.imagery is not None:
+                    info["base"] = self.write_quick_base(anchor, cx, cy)
+                    info["stages"]["baseQuick"] = time.perf_counter() - t1
+                if not info["base"]:
+                    self.quick_pool.submit(self._quick_later, anchor, cx, cy)
                 info["stages"]["baseWait"] = time.perf_counter() - t1
                 info["stages"]["baseLater"] = 1.0
                 base.add_done_callback(lambda f, key=(anchor.id, cx, cy): self._base_later(key, f))
@@ -2348,22 +2354,22 @@ class Server:
             # photo turned to the stand-in (or the flat base) with each new block (the user, 2026-10-30: "it flashes
             # already painted/loaded terrain instead of new terrain")
             n = self.base_px
-            rgb = np.zeros((n, n, 3), np.uint8)
-            have = np.zeros((n, n), bool)
             sc = n / size
             with self.base_lock:
                 recent = list(self.recent_full)
-            for aid, ocx, ocy, orgb in reversed(recent):        # (the newest first)
+            parts = []                  # (the oldest first: the newer is pasted over it)
+            have = np.zeros((n, n), bool)
+            for aid, ocx, ocy, orgb in recent:
                 if aid != anchor.id or orgb.shape[:2] != (n, n):
                     continue
                 dx, dy = int(round((cx - ocx) * sc)), int(round((ocy - cy) * sc))
                 i0, i1, j0, j1 = max(0, -dy), min(n, n - dy), max(0, -dx), min(n, n - dx)
-                if i0 >= i1 or j0 >= j1:
-                    continue
-                free = ~have[i0:i1, j0:j1]
-                rgb[i0:i1, j0:j1][free] = orgb[i0 + dy:i1 + dy, j0 + dx:j1 + dx][free]
-                have[i0:i1, j0:j1] = True
-            if not have.all():          # the rest (the new ground at the block's edge): the imagery alone
+                if i0 < i1 and j0 < j1:
+                    parts.append((i0, i1, j0, j1, dy, dx, orgb))
+                    have[i0:i1, j0:j1] = True
+            if have.all():
+                rgb = np.empty((n, n, 3), np.uint8)
+            else:                       # the rest (the new ground at the block's edge): the imagery alone
                 with (self.deshadow.no_wait() if self.deshadow is not None else contextlib.nullcontext()):
                     small, used = self.imagery.render(anchor.frame, x0, y0, size, QUICK_BASE_PX, set())
                 covered = sum(v for k, v in (used or {}).items() if k != "colormatch")
@@ -2379,8 +2385,11 @@ class Server:
                     except Exception as e:
                         log.debug("quick base photo %s: roads: %s", key, e)
                 # (at the photo's own size: the engine refuses another, "dont have required size of 4096-4096")
-                big = surfacemod.enlarge(small, n)
-                rgb[~have] = big[~have]
+                rgb = np.array(surfacemod.enlarge(small, n), np.uint8)
+            # plain slices, not masks: masked copies took 0.9 s of a 4096² stand-in's 1.4 s, and at 230 mph (a block
+            # every 1.2 s) the stand-ins fell behind and the flat base showed between them (the user, 2026-10-30)
+            for i0, i1, j0, j1, dy, dx, orgb in parts:
+                rgb[i0:i1, j0:j1] = orgb[i0 + dy:i1 + dy, j0 + dx:j1 + dx]
             name = self.quick_base_name(key)
             path = os.path.join(self.out_dir, name)
             tmp = staging.tmp_for(path)
