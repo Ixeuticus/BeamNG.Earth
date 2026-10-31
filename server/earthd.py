@@ -2226,7 +2226,9 @@ class Server:
         if base is not None:
             t1 = time.perf_counter()
             if not base.done():
-                concurrent.futures.wait([base], timeout=BASE_FAST_WAIT_S if self.fast else BASE_WAIT_S)
+                # below FAST_BASE_V it waits for its own photo again (as 1.7.2): sent before it, each block's ground
+                # swapped twice (stand-in, then the photo) and flashed at each (the user at 57-124 mph, 2026-10-30)
+                concurrent.futures.wait([base], timeout=BASE_FAST_WAIT_S if self.fast else None)
             if not base.done():
                 # the block goes now, a stand-in photo right after it (quick_later) and its own when done (block_base)
                 info["base"] = None
