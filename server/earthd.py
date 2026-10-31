@@ -248,6 +248,7 @@ SMALL_FAST_BASE_V = 35.0        # m/s (78 mph): FAST_BASE_V on a small machine (
 BASE_FAST_WAIT_S = 0.15         # heights, then goes without it (block_base later): blocks took 0.6-3 s at 600 mph on a
                                 # Steam Deck, mostly the photo (heights 0.1-0.4 s), and the game paused 11 times a minute
 QUICK_SYNC_MAX_V = 100.0        # m/s (224 mph): slower, a block built ahead gets its stand-in photo before it is ready
+QUICK_MIN_COVER = 0.8          # share of a stand-in's texels real imagery must cover (else no stand-in)
 QUICK_BASE_PX = 512             # a block's stand-in photo (write_quick_base): the imagery alone, 2 m texels
 BASE_WAIT_S = 0.5               # ... and at any speed this long: a 4-core PC's photos took ~26 s while the car was held at
                                 # the edge of its ground for 10-20 s (GitHub #496), and the wait held a heightmap thread
@@ -2338,7 +2339,12 @@ class Server:
         key = (anchor.id, cx, cy)
         try:
             with (self.deshadow.no_wait() if self.deshadow is not None else contextlib.nullcontext()):
-                rgb, _ = self.imagery.render(anchor.frame, x0, y0, size, QUICK_BASE_PX, set())
+                rgb, used = self.imagery.render(anchor.frame, x0, y0, size, QUICK_BASE_PX, set())
+            covered = sum(v for k, v in (used or {}).items() if k != "colormatch")
+            if covered < QUICK_MIN_COVER * QUICK_BASE_PX * QUICK_BASE_PX:
+                # its imagery not here yet: the renderer's dirt-brown fill over the whole block (the user, 2026-10-30:
+                # "the entire ground now turns brown"); none then, as before
+                return None
             rgb = np.asarray(rgb, np.uint8)
             if roadsmod.ROADS_IN_GROUND:    # the carriageways painted in at its own size (cached roads only): without
                 try:                        # them the roads' paint came and went at speed (the user, 2026-10-30)
