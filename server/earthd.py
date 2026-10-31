@@ -2339,8 +2339,14 @@ class Server:
         try:
             with (self.deshadow.no_wait() if self.deshadow is not None else contextlib.nullcontext()):
                 rgb, _ = self.imagery.render(anchor.frame, x0, y0, size, QUICK_BASE_PX, set())
+            rgb = np.asarray(rgb, np.uint8)
+            if roadsmod.ROADS_IN_GROUND:    # the carriageways painted in at its own size (cached roads only): without
+                try:                        # them the roads' paint came and went at speed (the user, 2026-10-30)
+                    rgb = surfacemod.paint_square(rgb, anchor.frame, x0, y0, size, self.surface, self.road_widths)
+                except Exception as e:
+                    log.debug("quick base photo %s: roads: %s", key, e)
             # (at the photo's own size: the engine refuses another, "dont have required size of 4096-4096")
-            rgb = surfacemod.enlarge(np.asarray(rgb, np.uint8), self.base_px)
+            rgb = surfacemod.enlarge(rgb, self.base_px)
             name = self.quick_base_name(key)
             path = os.path.join(self.out_dir, name)
             tmp = staging.tmp_for(path)
