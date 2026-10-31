@@ -601,6 +601,7 @@ local function finishRebase()
   farfield.switchAnchor(msg.anchorId, true, { cx = tr.cx, cy = tr.cy }, st.sessionId, rb.newAnchor)
   local cs = camshift.shift(xf, rb.playerOld[1], rb.playerOld[2], rb.playerOld[3])
   be:reloadCollision()
+  roads.collisionRebuilt()      -- (the moved colliders are solid: no second rebuild up to RELOAD_EVERY_S later)
 
   st.anchor, st.anchorId, st.anchorKey = rb.newAnchor, msg.anchorId, msg.anchorKey
   st.anchorSession, st.resync = st.sessionId, false

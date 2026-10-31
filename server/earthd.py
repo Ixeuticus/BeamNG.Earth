@@ -252,10 +252,10 @@ QUICK_SYNC_MAX_V = 150.0        # m/s (335 mph): slower, a block built ahead get
 RECENT_FULL = 2                 # full ground photos kept for the stand-ins' overlap (write_quick_base)
 QUICK_MIN_COVER = 0.8          # share of a stand-in's texels real imagery must cover (else no stand-in)
 QUICK_BASE_PX = 512             # a block's stand-in photo (write_quick_base): the imagery alone, 2 m texels
-BASE_WAIT_S = 0.5               # ... and at any speed this long: a 4-core PC's photos took ~26 s while the car was held at
-                                # the edge of its ground for 10-20 s (GitHub #496), and the wait held a heightmap thread
-                                # (the next block's heights waited behind it); a block asked for ahead gets its photo
-                                # before its commit anyway (block_base), the one under a waiting car goes without it
+BASE_WAIT_S = 2.5               # ... and slower, this long: a slow photo held the heightmap thread and the blocks behind
+                                # it (a city's first visit at 127 mph: 4.75 s for one photo, the next block 7.8 s and the
+                                # car at the edge of its ground; a 4-core PC's photos took ~26 s, GitHub #496); it then
+                                # goes with its stand-in, the photo after it (block_base)
 FAST_KEEP_S = 20.0              # ... and this long after it last was: a car the game holds for its ground (the drop
                                 # hold, the edge guard) reports no speed, and its next block waited for its photo
                                 # again (5-10 s at 500 mph on a first visit, Indianapolis 2026-10-30: held half the time)
@@ -2226,18 +2226,21 @@ class Server:
         if base is not None:
             t1 = time.perf_counter()
             if not base.done():
-                # below FAST_BASE_V it waits for its own photo again (as 1.7.2): sent before it, each block's ground
-                # swapped twice (stand-in, then the photo) and flashed at each (the user at 57-124 mph, 2026-10-30)
-                concurrent.futures.wait([base], timeout=BASE_FAST_WAIT_S if self.fast else None)
+                # below FAST_BASE_V it waits for its own photo (BASE_WAIT_S at most): sent before it, each block's
+                # ground swapped twice (stand-in, then the photo) and flashed at each (the user at 57-124 mph, 2026-10-30)
+                concurrent.futures.wait([base], timeout=BASE_FAST_WAIT_S if self.fast else BASE_WAIT_S)
+            quick = None
+            if not base.done() and getattr(self, "speed", 0.0) < QUICK_SYNC_MAX_V and self.imagery is not None:
+                quick = self.write_quick_base(anchor, cx, cy)
+                info["stages"]["baseQuick"] = time.perf_counter() - t1
+                if not quick and not self.fast:
+                    base.result()       # (no stand-in to show: slower, the photo is waited for, as before)
             if not base.done():
                 # the block goes now with a stand-in photo (below QUICK_SYNC_MAX_V made first: sent without one, the
                 # ground the last blocks had already shown went to the flat base until it came, "it flashes already
                 # painted ground", the user at 230 mph, 2026-10-30; faster, right after it) and its own when done
-                info["base"] = None
-                if getattr(self, "speed", 0.0) < QUICK_SYNC_MAX_V and self.imagery is not None:
-                    info["base"] = self.write_quick_base(anchor, cx, cy)
-                    info["stages"]["baseQuick"] = time.perf_counter() - t1
-                if not info["base"]:
+                info["base"] = quick
+                if not quick:
                     self.quick_pool.submit(self._quick_later, anchor, cx, cy)
                 info["stages"]["baseWait"] = time.perf_counter() - t1
                 info["stages"]["baseLater"] = 1.0
